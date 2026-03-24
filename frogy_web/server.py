@@ -1022,19 +1022,45 @@ def create_app() -> Flask:
         if not meta_path.exists():
             return jsonify({"error": "not found"}), 404
         meta = load_metadata(project_dir)
+
+        # Build a lookup of run status/stats from metadata.json runs list
+        runs_meta_map: Dict[str, Dict] = {}
+        for r in meta.get("runs", []):
+            rid = r.get("id")
+            if rid:
+                runs_meta_map[rid] = r
+
         runs = []
         try:
             for child in sorted(project_dir.iterdir(), reverse=True):
-                if not child.is_dir() or child.name in ("logs",):
+                # Only process actual run directories (run-YYYYMMDDHHMMSS)
+                if not child.is_dir():
+                    continue
+                if not child.name.startswith("run-"):
                     continue
                 report_path = child / "report.html"
-                run_meta_path = child / "run_meta.json"
-                run_info = {"run_id": child.name, "report_url": None, "status": "unknown"}
-                if run_meta_path.exists():
-                    try:
-                        run_info.update(load_json_file(run_meta_path))
-                    except Exception:
-                        pass
+                run_info: Dict[str, Any] = {
+                    "run_id": child.name,
+                    "report_url": None,
+                    "status": "unknown",
+                }
+                # Enrich from metadata runs list
+                meta_entry = runs_meta_map.get(child.name, {})
+                if meta_entry:
+                    run_info["status"] = meta_entry.get("status", "unknown")
+                    run_info["started_at"] = meta_entry.get("started_at")
+                    run_info["ran_at"] = meta_entry.get("completed_at")
+                    run_info["duration_seconds"] = None
+                    started = meta_entry.get("started_at")
+                    completed = meta_entry.get("completed_at")
+                    if started and completed:
+                        try:
+                            s = parse_iso_datetime(started)
+                            c = parse_iso_datetime(completed)
+                            run_info["duration_seconds"] = int((c - s).total_seconds())
+                        except Exception:
+                            pass
+                    run_info["summary_stats"] = meta_entry.get("summary_stats") or {}
                 if report_path.exists():
                     run_info["report_url"] = f"/projects/{slug}/runs/{child.name}/report"
                 log_path = project_dir / "logs" / f"{child.name}.log"
