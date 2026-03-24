@@ -117,7 +117,7 @@ declare -A CLOUD_CNAME_CACHE=()
 check_dependencies() {
 	info "Verifying required tools..."
 	local missing_tools=()
-	local required_tools=("subfinder" "assetfinder" "dnsx" "naabu" "httpx" "katana" "jq" "curl" "whois" "dig" "openssl" "tlsx" "xargs" "unzip" "grep" "sed" "awk")
+	local required_tools=("subfinder" "assetfinder" "dnsx" "naabu" "httpx" "katana" "nuclei" "jq" "curl" "whois" "dig" "openssl" "tlsx" "xargs" "unzip" "grep" "sed" "awk")
 
 	for tool in "${required_tools[@]}"; do
 		if ! command -v "$tool" &>/dev/null; then
@@ -158,7 +158,7 @@ run_health_check() {
 	echo ""
 
 	echo "── Tool versions ──────────────────────────────"
-	local required_tools=("subfinder" "assetfinder" "dnsx" "naabu" "httpx" "katana" "jq" "curl" "whois" "dig" "openssl" "tlsx" "xargs" "unzip" "grep" "sed" "awk")
+	local required_tools=("subfinder" "assetfinder" "dnsx" "naabu" "httpx" "katana" "nuclei" "jq" "curl" "whois" "dig" "openssl" "tlsx" "xargs" "unzip" "grep" "sed" "awk")
 	for tool in "${required_tools[@]}"; do
 		if command -v "$tool" &>/dev/null; then
 			local ver
@@ -3388,6 +3388,125 @@ run_cloud_storage_check() {
 }
 
 # --- NEW MODULE: Change Detection vs. previous run ---
+# ─── MODULE: Nuclei Vulnerability Scan ───────────────────────────────────────
+# Runs nuclei against:
+#   1) Live URLs from httpx.json  (web-layer coverage)
+#   2) All host:port pairs from naabu.json  (network-layer coverage)
+# Templates: all built-in tags except fuzzing (cves, exposures, misconfiguration,
+#            default-logins, technologies, network, etc.)
+# Output: nuclei.json (JSONL array) consumed by build_html_report → nucleiData
+run_nuclei_scan() {
+	info "[31/32] Running nuclei vulnerability scan..."
+	local output_file="$RUN_DIR/nuclei.json"
+	local nuclei_jsonl="$RUN_DIR/nuclei_raw.jsonl"
+	local targets_file="$RUN_DIR/nuclei_targets.txt"
+	: >"$nuclei_jsonl"
+	: >"$targets_file"
+
+	# ── build target list ─────────────────────────────────────────────────────
+	# Source 1: live URLs from httpx
+	if [[ -s "$RUN_DIR/httpx.json" ]]; then
+		jq -r '(if type=="array" then .[] else . end) | .url // empty' \
+			"$RUN_DIR/httpx.json" 2>/dev/null \
+			| grep -v '^null$' | grep -v '^$' \
+			>>"$targets_file" || true
+	fi
+
+	# Source 2: host:port from naabu (converts to URLs for nuclei)
+	if [[ -s "$RUN_DIR/naabu.json" ]]; then
+		jq -r 'select(type=="object") | "\(.host):\(.port)"' \
+			"$RUN_DIR/naabu.json" 2>/dev/null \
+			| grep -v '^:' | grep -v '^$' \
+			>>"$targets_file" || true
+	fi
+
+	sort -u "$targets_file" -o "$targets_file"
+	local target_count
+	target_count=$(wc -l <"$targets_file" | tr -d ' ')
+
+	if [[ ! -s "$targets_file" ]]; then
+		warning "nuclei: no targets found — skipping scan."
+		echo "[]" >"$output_file"
+		quality_check_json_array "Nuclei scan" "$output_file"
+		rm -f "$targets_file" "$nuclei_jsonl"
+		return
+	fi
+
+	info "  → nuclei targets: ${target_count} (httpx URLs + naabu host:port)"
+
+	# ── template selection ────────────────────────────────────────────────────
+	# Flags confirmed from `nuclei -h`:
+	#   -etags          exclude templates by tag (comma-separated)
+	#   -es             exclude-severity: skip templates of these severities
+	#   -s              run only these severities
+	#   -jle            jsonl-export: write JSONL output to file (correct flag for file output)
+	#   -ot             omit encoded template body from output (smaller file)
+	#   -or             omit raw request/response pairs (smaller file)
+	#   -silent         display findings only (suppress banner/stats to stdout)
+	#   -retries        number of retries for failed requests (default 1)
+	#   -timeout        timeout in seconds per request (default 10)
+	#   -rl             rate-limit: max requests per second (default 150)
+	#   -c              concurrency: parallel template executions (default 25)
+	#   -bs             bulk-size: hosts per template in parallel (default 25)
+	#   -duc            disable-update-check: skip auto-update on startup
+	local nuclei_exclude_tags="fuzzing,fuzz,dos,dast"
+
+	# ── run nuclei ────────────────────────────────────────────────────────────
+	local nuclei_log="$RUN_DIR/logs/nuclei.log"
+	heartbeat_start "scanning with nuclei"
+	timeout 7200 nuclei \
+		-l "$targets_file" \
+		-etags "$nuclei_exclude_tags" \
+		-es unknown \
+		-jle "$nuclei_jsonl" \
+		-ot \
+		-or \
+		-silent \
+		-retries 1 \
+		-timeout 10 \
+		-rl 100 \
+		-c 25 \
+		-bs 25 \
+		-duc \
+		2>"$nuclei_log" || {
+			warning "nuclei timed out or exited non-zero — continuing with partial results. See $nuclei_log"
+			true
+		}
+	heartbeat_stop
+
+	# ── normalise JSONL → JSON array ─────────────────────────────────────────
+	if [[ -s "$nuclei_jsonl" ]]; then
+		# nuclei JSONL may mix objects and non-objects; filter strictly
+		jq -cs '
+			map(select(type=="object"))
+			| map({
+				template_id:  (.template-id   // .templateID   // ""),
+				template_name:(.info.name      // ""),
+				severity:     (.info.severity  // "info"),
+				host:         (.host           // ""),
+				matched_at:   (.matched-at     // .matched_at   // ""),
+				url:          (.url            // ""),
+				type:         (.type           // ""),
+				tags:         (.info.tags      // []),
+				reference:    (.info.reference // []),
+				description:  (.info.description // ""),
+				curl_command: (."curl-command" // ""),
+				extracted:    (.extracted-results // [])
+			})
+		' "$nuclei_jsonl" >"$output_file" 2>/dev/null \
+			|| echo "[]" >"$output_file"
+	else
+		echo "[]" >"$output_file"
+	fi
+
+	local finding_count
+	finding_count=$(jq 'length' "$output_file" 2>/dev/null || echo 0)
+	info "  → nuclei findings: ${finding_count}"
+
+	rm -f "$targets_file" "$nuclei_jsonl"
+	quality_check_json_array "Nuclei scan" "$output_file"
+}
+
 # glue the UI shell with the datasets and drop the finished HTML
 build_html_report() {
 info "[32/32] Building HTML report..."
@@ -3494,6 +3613,9 @@ info "[32/32] Building HTML report..."
 	echo -n "const scoringThirdPartyVendors = " >>report.html
 	if [ -s "assets/lists/scoring-thirdparty-vendors.json" ]; then jq -c . "assets/lists/scoring-thirdparty-vendors.json"; else echo '{"payment_processors":[],"identity_providers":[],"high_risk_categories":[]}'; fi | tr -d "\n" >>report.html
 	echo "" >>report.html
+	echo -n "const nucleiData = " >>report.html
+	if [ -s "${RUN_DIR}/nuclei.json" ] && jq -e . "${RUN_DIR}/nuclei.json" >/dev/null 2>&1; then jq -c . "${RUN_DIR}/nuclei.json"; else echo "[]"; fi | tr -d "\n" >>report.html
+	echo "" >>report.html
 	cat footer.html >>report.html
 
 	mkdir -p "$RUN_DIR/assets"
@@ -3521,6 +3643,7 @@ quality_post_run_checks() {
 	quality_check_json_array "Takeover detection" "$RUN_DIR/takeover.json"
 	quality_check_json_array "JS analysis" "$RUN_DIR/js_analysis.json"
 	quality_check_json_array "Cloud storage" "$RUN_DIR/cloud_storage.json"
+	quality_check_json_array "Nuclei scan" "$RUN_DIR/nuclei.json"
 	quality_check_hosts_against_master "HTTP inventory" "$RUN_DIR/httpx.json" '(if type=="array" then .[] else . end) | (.input // .url // .host // "") | sub("^https?://"; "") | split("/")[0] | split(":")[0] | ascii_downcase'
 	quality_check_hosts_against_master "TLS inventory" "$RUN_DIR/tls_inventory.json" '(if type=="array" then .[] else . end) | (.Host // .host // .Domain // .domain // "") | ascii_downcase'
 	quality_check_hosts_against_master "Cloud inventory" "$RUN_DIR/cloud_infrastructure.json" '(if type=="array" then .[] else . end) | (.Asset // "") | ascii_downcase'
@@ -4380,7 +4503,8 @@ main() {
 	run_cloud_infrastructure_inventory         # [30/32]
 	run_cloud_storage_check                    # [30/32] storage exposure (runs after cloud infra)
 	run_cloud_bucket_enhanced                  # [30/32] enhanced permutation check
-	build_html_report                          # [31/31]
+	run_nuclei_scan                            # [31/32] nuclei vuln scan (live URLs + naabu ports)
+	build_html_report                          # [32/32]
 	quality_post_run_checks
 	show_summary
 	# write pipeline stats for the web UI dashboard

@@ -589,6 +589,17 @@
       .badge--gray   { background: rgba(156,163,175,.1); color: #9ca3af; font-weight: 400; }
       .badge--mono   { background: rgba(156,163,175,.08); color: var(--color-text-muted); font-weight: 400; font-family: monospace; font-size: .7rem; }
 
+      /* ── Nuclei severity badges ───────────────────────────────────── */
+      .sev-critical { background: rgba(239,68,68,.18);  color: #f87171; border: 1px solid rgba(239,68,68,.35); }
+      .sev-high     { background: rgba(249,115,22,.18); color: #fb923c; border: 1px solid rgba(249,115,22,.35); }
+      .sev-medium   { background: rgba(234,179,8,.18);  color: #facc15; border: 1px solid rgba(234,179,8,.35); }
+      .sev-low      { background: rgba(59,130,246,.18); color: #60a5fa; border: 1px solid rgba(59,130,246,.35); }
+      .sev-info     { background: rgba(156,163,175,.12);color: #9ca3af; border: 1px solid rgba(156,163,175,.25); }
+      .nuclei-tag   { display:inline-block; padding:.1rem .35rem; border-radius:3px; font-size:.68rem;
+                      background: rgba(96,165,250,.1); color: #93c5fd; margin:.1rem .1rem 0 0; }
+      #nucleiTableWrap td { vertical-align: top; }
+      #nucleiTableWrap td.col-desc { max-width: 320px; font-size:.78rem; color: var(--color-text-muted); }
+
 
       .sub-section-label {
         font-size: .78rem;
@@ -894,7 +905,8 @@
         "seed-expansion": "Internet Footprint",
         "saas-cloud": "SaaS Tenants",
         "third-parties": "Third Parties",
-        "asset-topology": "Asset Topology"
+        "asset-topology": "Asset Topology",
+        "nuclei": "Vulnerabilities"
       });
       const TABLE_VIEW_CLASSNAMES = Object.freeze(Object.keys(VIEW_LABELS).map(view => `table-view--${view}`));
       const COLUMN_CLASS_MAP = Object.freeze([
@@ -1018,6 +1030,7 @@
               <button type="button" class="report-nav__item" data-view="saas-cloud" aria-pressed="false">SaaS Tenants</button>
               <button type="button" class="report-nav__item" data-view="third-parties" aria-pressed="false">Third Parties</button>
               <button type="button" class="report-nav__item" data-view="asset-topology" aria-pressed="false">Asset Topology</button>
+              <button type="button" class="report-nav__item" data-view="nuclei" aria-pressed="false">Vulnerabilities</button>
             </div>
           </nav>
         </aside>
@@ -1530,7 +1543,55 @@
           </div>
 
 
-        <div class="table-scroll-controls view-block" data-view-group="overview" role="group" aria-label="Overview table scroll controls">
+        <!-- ═══════════════════════════════════════════════════════════════
+             NUCLEI — Vulnerability Findings
+             ═══════════════════════════════════════════════════════════════ -->
+        <section class="focus-header view-block" data-view-group="nuclei">
+          <div>
+            <h2>Vulnerability Findings</h2>
+            <p class="focus-description">&nbsp;&nbsp;&nbsp;Results from nuclei scans across live HTTP endpoints and open ports — CVEs, misconfigurations, exposed files, and default credentials detected across all discovered assets.</p>
+          </div>
+          <button type="button" class="about-section-btn" data-section="nuclei">ⓘ About</button>
+        </section>
+
+        <section class="table-top-controls view-block" data-view-group="nuclei">
+          <input type="text" id="nucleiSearch" placeholder="Search findings…" autocomplete="off" />
+          <div class="table-controls">
+            <label>Severity
+              <select id="nucleiSeverityFilter">
+                <option value="">All</option>
+                <option value="critical">Critical</option>
+                <option value="high">High</option>
+                <option value="medium">Medium</option>
+                <option value="low">Low</option>
+              </select>
+            </label>
+            <label>Type
+              <select id="nucleiTypeFilter">
+                <option value="">All types</option>
+              </select>
+            </label>
+            <span id="nucleiCount" class="ag-stats"></span>
+          </div>
+        </section>
+
+        <p class="sub-section-label view-block" data-view-group="nuclei">All Findings</p>
+        <div class="table-container view-block" data-view-group="nuclei" id="nucleiTableWrap">
+          <table id="nucleiTable">
+            <thead>
+              <tr>
+                <th>Severity</th>
+                <th>Template</th>
+                <th>Host</th>
+                <th>Matched At</th>
+                <th>Type</th>
+                <th>Tags</th>
+                <th>Description</th>
+              </tr>
+            </thead>
+            <tbody id="nucleiTableBody"></tbody>
+          </table>
+        </div> role="group" aria-label="Overview table scroll controls">
             <button type="button" class="table-scroll-button" data-direction="left">◀</button>
             <button type="button" class="table-scroll-button" data-direction="right">▶</button>
           </div>
@@ -2967,6 +3028,7 @@
           "saas-cloud":    () => { try { renderSaasCloudTables(); } catch(e) { console.error("renderSaasCloud:", e); } },
           "third-parties": () => { try { renderThirdPartyTables(); } catch(e) { console.error("renderThirdParty:", e); } },
           "asset-topology": () => { try { renderAssetTopologyGraph(); } catch(e) { console.error("renderAssetTopology:", e); } },
+          "nuclei":          () => { try { renderNucleiTable(); } catch(e) { console.error("renderNuclei:", e); } },
         };
 
         const applyView = (view) => {
@@ -6170,6 +6232,104 @@ function buildInsightsCharts({
           return tr;
         });
         renderSimpleBody("tpi-detail-body", detailRows);
+      }
+
+      // ── Nuclei ─ vulnerability findings table ────────────────────────────
+      function renderNucleiTable() {
+        const raw = (typeof nucleiData !== "undefined" ? nucleiData : []) || [];
+
+        // severity sort order
+        const SEV_ORDER = { critical: 0, high: 1, medium: 2, low: 3, info: 4, "": 5 };
+
+        // badge HTML for a severity string
+        const sevBadge = (sev) => {
+          const s = (sev || "info").toLowerCase();
+          return `<span class="badge sev-${s}" style="text-transform:uppercase;letter-spacing:.05em;font-size:.7rem">${s}</span>`;
+        };
+
+        // populate Type filter once
+        const typeSelect = document.getElementById("nucleiTypeFilter");
+        if (typeSelect && typeSelect.options.length === 1) {
+          const types = [...new Set(raw.map(r => r.type).filter(Boolean))].sort();
+          types.forEach(t => {
+            const o = document.createElement("option");
+            o.value = t; o.textContent = t;
+            typeSelect.appendChild(o);
+          });
+        }
+
+        // filter + render
+        const doRender = () => {
+          const query  = (document.getElementById("nucleiSearch")?.value || "").toLowerCase();
+          const sevF   = (document.getElementById("nucleiSeverityFilter")?.value || "").toLowerCase();
+          const typeF  = (document.getElementById("nucleiTypeFilter")?.value || "").toLowerCase();
+
+          const filtered = raw
+            .filter(r => {
+              if (sevF  && (r.severity || "").toLowerCase() !== sevF)  return false;
+              if (typeF && (r.type     || "").toLowerCase() !== typeF) return false;
+              if (query) {
+                const blob = [r.template_id, r.template_name, r.host,
+                              r.matched_at, r.description, (r.tags || []).join(" ")]
+                  .join(" ").toLowerCase();
+                if (!blob.includes(query)) return false;
+              }
+              return true;
+            })
+            .sort((a, b) => {
+              const sa = SEV_ORDER[(a.severity || "").toLowerCase()] ?? 5;
+              const sb = SEV_ORDER[(b.severity || "").toLowerCase()] ?? 5;
+              return sa !== sb ? sa - sb : (a.host || "").localeCompare(b.host || "");
+            });
+
+          // update count badge
+          const countEl = document.getElementById("nucleiCount");
+          if (countEl) countEl.textContent = `${filtered.length} finding${filtered.length !== 1 ? "s" : ""}`;
+
+          const tbody = document.getElementById("nucleiTableBody");
+          if (!tbody) return;
+          tbody.innerHTML = "";
+
+          if (!filtered.length) {
+            const tr = document.createElement("tr");
+            tr.innerHTML = `<td colspan="7" style="text-align:center;color:var(--color-text-muted,#888);padding:2rem">No findings match the current filters.</td>`;
+            tbody.appendChild(tr);
+            return;
+          }
+
+          filtered.forEach(r => {
+            const tr = document.createElement("tr");
+            const tags = (r.tags || []).map(t => `<span class="nuclei-tag">${t}</span>`).join("");
+            const matchedAt = r.matched_at || r.url || "";
+            const matchedDisplay = matchedAt
+              ? `<a href="${matchedAt}" target="_blank" rel="noopener noreferrer" style="word-break:break-all;font-size:.78rem">${matchedAt}</a>`
+              : "–";
+            const templateDisplay = r.template_name
+              ? `<strong>${r.template_name}</strong><br><code style="font-size:.68rem;color:var(--color-text-muted)">${r.template_id}</code>`
+              : `<code>${r.template_id || "–"}</code>`;
+            const desc = r.description
+              ? `<span title="${r.description.replace(/"/g,'&quot;')}">${r.description.length > 120 ? r.description.slice(0, 120) + "…" : r.description}</span>`
+              : "–";
+
+            tr.innerHTML = `
+              <td>${sevBadge(r.severity)}</td>
+              <td>${templateDisplay}</td>
+              <td style="word-break:break-all;font-size:.8rem">${r.host || "–"}</td>
+              <td>${matchedDisplay}</td>
+              <td><code style="font-size:.75rem">${r.type || "–"}</code></td>
+              <td>${tags || "–"}</td>
+              <td class="col-desc">${desc}</td>`;
+            tbody.appendChild(tr);
+          });
+        };
+
+        // wire up live filters
+        ["nucleiSearch", "nucleiSeverityFilter", "nucleiTypeFilter"].forEach(id => {
+          const el = document.getElementById(id);
+          if (el) el.addEventListener("input", doRender);
+        });
+
+        doRender();
       }
 
       // ── Helper ─ render simple tbody from array of <tr> elements ─────────
