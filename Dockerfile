@@ -26,8 +26,9 @@ RUN go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@${SUBFINDE
  && go install github.com/lc/gau/v2/cmd/gau@${GAU_VER} \
  && go install github.com/projectdiscovery/katana/cmd/katana@${KATANA_VER} \
  && go install github.com/projectdiscovery/tlsx/cmd/tlsx@${TLSX_VER} \
- && go install github.com/gwen001/github-subdomains@${GITHUB_SUBDOMAINS_VER} \
- && go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@${NUCLEI_VER}
+ && go install github.com/gwen001/github-subdomains@${GITHUB_SUBDOMAINS_VER}
+
+RUN go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@${NUCLEI_VER}
 
 FROM ubuntu:24.04
 
